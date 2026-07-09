@@ -21,7 +21,6 @@ import org.apache.logging.log4j.Logger;
 import qz.build.provision.params.Arch;
 import qz.build.provision.params.Os;
 import qz.common.Constants;
-import qz.common.TrayManager;
 import qz.installer.Installer;
 
 import javax.swing.*;
@@ -30,6 +29,8 @@ import java.awt.geom.Area;
 import java.io.File;
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -39,10 +40,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Locale;
-import java.util.Random;
-import java.util.TimeZone;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * Utility class for OS detection functions.
@@ -54,7 +54,7 @@ public class SystemUtilities {
     static final String OS_ARCH = System.getProperty("os.arch");
     private static final Os OS_TYPE = Os.bestMatch(OS_NAME);
     private static final Arch JRE_ARCH = Arch.bestMatch(OS_ARCH);
-    private static final Logger log = LogManager.getLogger(TrayManager.class);
+    private static final Logger log = LogManager.getLogger(SystemUtilities.class);
 
     private static double windowScaleFactor = -1;
     private static final Locale defaultLocale = Locale.getDefault();
@@ -136,6 +136,19 @@ public class SystemUtilities {
     }
 
     /**
+     * Manipulate a Version into another format (x.x.x.0), e.g. 2.2.6-SNAPSHOT --> 2.2.6.0
+     * Note, this is rigid and can't dynamically output "-" or "+" based on prerelease status
+     */
+    public static String formatVersion(Version version, String format) {
+        String output = format;
+        output = output.replaceFirst("x", String.valueOf(version.majorVersion()));
+        output = output.replaceFirst("x", String.valueOf(version.minorVersion()));
+        output = output.replaceFirst("x", String.valueOf(version.patchVersion()));
+        output = output.replaceFirst("x", version.buildMetadata().orElse(version.preReleaseVersion().orElse("0")));
+        return output;
+    }
+
+    /**
      * The human-readable display version of the OS (e.g. "22.04.1 LTS (Jammy Jellyfish)")
      */
     public static String getOsDisplayVersion() {
@@ -192,22 +205,10 @@ public class SystemUtilities {
         return whoami;
     }
 
-    public static Version getJavaVersion() {
-        return getJavaVersion(System.getProperty("java.version"));
-    }
-
-    /**
-     * Call a java command (e.g. java) with "--version" and parse the output
-     * The double dash "--" is since JDK9 but important to send the command output to stdout
-     */
-    public static Version getJavaVersion(Path javaCommand) {
-        return getJavaVersion(ShellUtilities.executeRaw(javaCommand.toString(), "--version"));
-    }
-
     public static int getProcessId() {
         if(pid == null) {
             // Try Java 9+
-            if(Constants.JAVA_VERSION.getMajorVersion() >= 9) {
+            if(Constants.JAVA_VERSION.majorVersion() >= 9) {
                 pid = getProcessIdJigsaw();
             }
             // Try JNA
@@ -232,47 +233,6 @@ public class SystemUtilities {
             log.warn("Could not get process ID using Java 9+, will attempt to fallback to JNA", t);
         }
         return -1;
-    }
-
-    /**
-     * Handle Java versioning nuances
-     * To eventually be replaced with <code>java.lang.Runtime.Version</code> (JDK9+)
-     */
-    public static Version getJavaVersion(String version) {
-        String[] parts = version.trim().split("\\D+");
-
-        int major = 1;
-        int minor = 0;
-        int patch = 0;
-        String meta = "";
-
-        try {
-            switch(parts.length) {
-                default:
-                case 4:
-                    meta = parts[3];
-                case 3:
-                    patch = Integer.parseInt(parts[2]);
-                case 2:
-                    minor = Integer.parseInt(parts[1]);
-                    major = Integer.parseInt(parts[0]);
-                    break;
-                case 1:
-                    major = Integer.parseInt(parts[0]);
-                    if (major <= 8) {
-                        // Force old 1.x style formatting
-                        minor = major;
-                        major = 1;
-                    }
-            }
-        } catch(NumberFormatException e) {
-            log.warn("Could not parse Java version \"{}\"", e);
-        }
-        if(meta.trim().isEmpty()) {
-            return Version.forIntegers(major, minor, patch);
-        } else {
-            return Version.forIntegers(major, minor, patch).setBuildMetadata(meta);
-        }
     }
 
     /**
@@ -599,6 +559,23 @@ public class SystemUtilities {
     }
 
     /**
+     * Determine if we're installed system-wide
+     */
+    public static boolean isInstalledSystemWide() {
+        if(isInstalled()) {
+            switch(getOs()) {
+                case MAC:
+                    return Objects.requireNonNull(getJarParentPath()).startsWith("/Applications");
+                case WINDOWS:
+                    return WindowsUtilities.isAdminOwned(Objects.requireNonNull(SystemUtilities.getJarPath()));
+                default:
+                    return Objects.requireNonNull(getJarParentPath()).startsWith("/opt");
+            }
+        }
+        return false;
+    }
+
+    /**
      * Allows in-line insertion of a property before another
      * @param value the end of a value to insert before, assumes to end with File.pathSeparator
      */
@@ -764,6 +741,42 @@ public class SystemUtilities {
     }
 
     /**
+     * For "Restart Now" button
+     */
+    public static String calculatePidChallenge(String pid, int saltLength) {
+        // more salt
+        String alphabet = "0123456789abcdefghijklmnopqrstuvwxyz";
+        StringBuilder pidSalted = new StringBuilder(saltLength + pid.length());
+        for (int i = 0; i < saltLength; i++) {
+            int index = ThreadLocalRandom.current().nextInt(alphabet.length());
+            pidSalted.append(alphabet.charAt(index));
+        }
+        pidSalted.append(pid);
+
+        StringBuilder pidChallenge = new StringBuilder();
+        pidChallenge.append(new String(Base64.encodeBase64(pidSalted.toString().getBytes(StandardCharsets.UTF_8), false)));
+        pidChallenge.append(calculateSaltedChallenge());
+        return new String(Base64.encodeBase64(pidChallenge.toString().getBytes(StandardCharsets.UTF_8), false));
+    }
+
+    /**
+     * For "Restart Now" button
+     */
+    public static Boolean validatePidChallenge(String pid, String challenge, int saltLength) {
+        String decodedBoth = new String(Base64.decodeBase64(challenge), StandardCharsets.UTF_8);
+        int pidSaltedLength = ((saltLength + pid.length() + 2) / 3) * 4;
+        String pidSalted = decodedBoth.substring(0, pidSaltedLength);
+        String pidSaltedDecoded = new String(Base64.decodeBase64(pidSalted), StandardCharsets.UTF_8);
+        String pidDecoded = pidSaltedDecoded.substring(saltLength);
+        if(!pid.equals(pidDecoded)) {
+            return false;
+        }
+
+        String challengeDecoded = decodedBoth.substring(pidSaltedLength);
+        return validateSaltedChallenge(challengeDecoded);
+    }
+
+    /**
      * Decodes challenge string to see if it originated from this application
      * - Base64 string is decoded into two bytes
      * - First byte is unsalted
@@ -782,8 +795,8 @@ public class SystemUtilities {
             long salted = buffer.getLong(0); // only first byte matters
             long challenge = salted / 10L;
             return challenge == calculateChallenge();
-        } catch(Exception ignore) {
-            log.warn("An exception occurred validating challenge: {}", message, ignore);
+        } catch(Exception e) {
+            log.warn("An exception occurred validating challenge: {}", message, e);
         }
         return false;
     }
@@ -808,5 +821,23 @@ public class SystemUtilities {
             return SystemTray.isSupported();
         }
         return false;
+    }
+
+    public static String parseRootDomain(String urlString) {
+        try {
+            // 1. Parse the URL string
+            URL url = new URL(urlString);
+            String host = url.getHost(); // This returns "subdomain.example.com"
+
+            // 2. Split the host by the dot (.)
+            String[] parts = host.split("\\.");
+
+            // 3. Check if the host has enough parts (e.g., at least 'example' and 'com')
+            if (parts.length >= 2) {
+                return parts[parts.length - 2] + "." + parts[parts.length - 1];
+            }
+        } catch (MalformedURLException ignore) {}
+
+        return null;
     }
 }
